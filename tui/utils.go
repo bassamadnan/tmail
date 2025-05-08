@@ -2,20 +2,23 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bassamadnan/tmail/gmail"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// For robust newline removal (handles \r\n, \n, \r)
+var newlineRegex = regexp.MustCompile(`\r\n|\r|\n`)
 
 // truncate shortens a string to a max length, adding "..." if truncated.
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	// If maxLen is too small for "...", just truncate to maxLen.
-	// Ensure maxLen is not negative or zero to avoid slice panic.
 	if maxLen <= 0 {
 		return ""
 	}
@@ -31,24 +34,47 @@ func formatEmailDate(t time.Time) string {
 		return "???"
 	}
 	now := time.Now()
-	if t.Year() == now.Year() && t.Month() == now.Month() && t.Day() == now.Day() {
-		return t.Local().Format("15:04") // Time only for today
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	emailDay := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+
+	if emailDay.Equal(today) {
+		return t.Local().Format("15:04")
 	}
-	return t.Local().Format("Jan02") // Date for other days
+	return t.Local().Format("Jan 2")
+}
+
+// sanitizeStringForLineAggressive removes newlines and other non-printable characters.
+func sanitizeStringForLineAggressive(s string) string {
+	// First, handle explicit newline sequences by replacing them with a space
+	s = newlineRegex.ReplaceAllString(s, " ")
+
+	// Then, iterate through runes to keep only printable characters
+	// and replace others with a space.
+	var builder strings.Builder
+	for _, r := range s {
+		if unicode.IsPrint(r) { // unicode.IsPrint checks if the rune is printable
+			builder.WriteRune(r)
+		} else {
+			builder.WriteRune(' ') // Replace non-printable with a space
+		}
+	}
+	s = builder.String()
+
+	// Finally, collapse multiple spaces that might have resulted from replacements
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // formatEmailListItem formats a single email for the list view.
-// contentWidth is the width for the text *inside* the box lines (excluding the 2 spaces for padding next to vertical bars).
+// itemContentTextWidth is the width for the text *inside* the box lines.
 func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemContentTextWidth int) string {
-	// Determine styles based on selection state
 	var boxCharStyle, subjectStyle, secondaryTextStyle lipgloss.Style
-	var itemBlockStyle lipgloss.Style // The overall style for the 4-line block
+	var itemBlockStyle lipgloss.Style
 
 	if isSelected {
 		boxCharStyle = SelectedBoxCharStyle
 		subjectStyle = SelectedSubjectStyle
 		secondaryTextStyle = SelectedSecondaryTextStyle
-		itemBlockStyle = SelectedEmailListItemStyle // This style now mainly provides padding and perhaps a very subtle overall tint if desired.
+		itemBlockStyle = SelectedEmailListItemStyle
 	} else {
 		boxCharStyle = NormalBoxCharStyle
 		subjectStyle = NormalSubjectStyle
@@ -56,18 +82,15 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 		itemBlockStyle = EmailListItemStyle
 	}
 
-	// Prepare subject text: Truncate and pad to ensure it fills itemContentTextWidth
-	subject := email.Subject
+	// Use aggressive sanitization
+	subject := sanitizeStringForLineAggressive(email.Subject)
 	if subject == "" {
 		subject = "(No Subject)"
 	}
-	// Truncate the raw subject string first
 	truncatedSubject := truncate(subject, itemContentTextWidth)
-	// Then pad the truncated string to the full itemContentTextWidth
 	paddedSubjectText := fmt.Sprintf("%-*s", itemContentTextWidth, truncatedSubject)
 
-	// Prepare From/Date text
-	fromShort := email.From
+	fromShort := sanitizeStringForLineAggressive(email.From)
 	if idx := strings.Index(fromShort, "<"); idx > 0 {
 		fromShort = strings.TrimSpace(fromShort[:idx])
 	}
@@ -76,11 +99,9 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 	}
 	dateStr := formatEmailDate(email.Date)
 
-	// Attempt to fit "From ... Date" into itemContentTextWidth
-	// Max length for 'from', accounting for date (5 chars) and a space (1 char) = 6
-	maxFromLen := itemContentTextWidth - len(dateStr) - 1
-	if maxFromLen < 1 { // Not enough space for 'from' part, just show date or part of it
-		fromShort = "" // Or truncate fromShort to what very little space is left
+	maxFromLen := itemContentTextWidth - (len(dateStr) + 1)
+	if maxFromLen < 1 {
+		fromShort = ""
 		if len(dateStr) > itemContentTextWidth {
 			dateStr = truncate(dateStr, itemContentTextWidth)
 		}
@@ -88,22 +109,17 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 		fromShort = truncate(fromShort, maxFromLen)
 	}
 
-	// Construct the fromDate string, ensuring it doesn't exceed itemContentTextWidth
 	var fromToDateCombined string
 	if fromShort != "" {
 		fromToDateCombined = fmt.Sprintf("%s %s", fromShort, dateStr)
 	} else {
 		fromToDateCombined = dateStr
 	}
-	// If combined is too long, truncate (though logic above should prevent this mostly)
 	if len(fromToDateCombined) > itemContentTextWidth {
 		fromToDateCombined = truncate(fromToDateCombined, itemContentTextWidth)
 	}
-	// Pad the final fromToDateCombined string
 	paddedFromToDateText := fmt.Sprintf("%-*s", itemContentTextWidth, fromToDateCombined)
 
-	// Construct the 4 lines for the box, applying styles to parts
-	// itemContentTextWidth is for the text. The horizontal bar needs to span this + 2 spaces.
 	horizontalBar := strings.Repeat(BoxHorizontal, itemContentTextWidth+2)
 
 	line1 := fmt.Sprintf("%s%s%s",
@@ -113,12 +129,12 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 	)
 	line2 := fmt.Sprintf("%s %s %s",
 		boxCharStyle.Render(BoxVertical),
-		subjectStyle.Render(paddedSubjectText), // Render padded text with subject style
+		subjectStyle.Render(paddedSubjectText),
 		boxCharStyle.Render(BoxVertical),
 	)
 	line3 := fmt.Sprintf("%s %s %s",
 		boxCharStyle.Render(BoxVertical),
-		secondaryTextStyle.Render(paddedFromToDateText), // Render padded text with secondary style
+		secondaryTextStyle.Render(paddedFromToDateText),
 		boxCharStyle.Render(BoxVertical),
 	)
 	line4 := fmt.Sprintf("%s%s%s",
@@ -127,6 +143,5 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 		boxCharStyle.Render(BoxBottomRight),
 	)
 
-	// Join the lines and apply the overall item block style (mainly for padding)
 	return itemBlockStyle.Render(strings.Join([]string{line1, line2, line3, line4}, "\n"))
 }

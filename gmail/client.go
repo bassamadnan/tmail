@@ -112,19 +112,26 @@ func (c *Client) parseEmailDetails(msg *gmail.Message) ProcessedEmail {
 			if err != nil {
 				parsedDate, err = time.Parse("Mon, 2 Jan 2006 15:04:05 -0700 (MST)", header.Value)
 				if err != nil {
-					parsedDate, err = time.Parse("2 Jan 2006 15:04:05 -0700", header.Value) // Often without day name
+					parsedDate, err = time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", header.Value) // Added this common case
 					if err != nil {
-						// Try removing timezone in parentheses like (PST), (UTC)
-						noTZParen := strings.ReplaceAll(strings.ReplaceAll(header.Value, " (UTC)", ""), " (PST)", "") // Add more common ones
-						noTZParen = strings.ReplaceAll(noTZParen, " (PDT)", "")
-						noTZParen = strings.ReplaceAll(noTZParen, " (CET)", "")
-						noTZParen = strings.ReplaceAll(noTZParen, " (CEST)", "")
-
-						parsedDate, err = time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", noTZParen)
+						parsedDate, err = time.Parse("2 Jan 2006 15:04:05 -0700", header.Value)
 						if err != nil {
-							parsedDate, err = time.Parse(time.RFC1123, header.Value) // Common format without explicit zone offset number
+							noTZParen := header.Value
+							if openParen := strings.LastIndex(noTZParen, " ("); openParen != -1 {
+								if closeParen := strings.LastIndex(noTZParen, ")"); closeParen > openParen {
+									noTZParen = noTZParen[:openParen] + noTZParen[closeParen+1:]
+								}
+							}
+							noTZParen = strings.TrimSpace(noTZParen)
+							parsedDate, err = time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", noTZParen)
 							if err != nil {
-								log.Printf("Warning: Could not parse date string '%s': %v", header.Value, err)
+								parsedDate, err = time.Parse(time.RFC1123, noTZParen)
+								if err != nil {
+									parsedDate, err = time.Parse(time.RFC822, noTZParen)
+									if err != nil {
+										log.Printf("Warning: Could not parse date string '%s' (original: '%s'): %v", noTZParen, header.Value, err)
+									}
+								}
 							}
 						}
 					}
@@ -149,8 +156,11 @@ func getPlainTextBody(payload *gmail.MessagePart) string {
 	}
 	if payload.Parts != nil {
 		for _, part := range payload.Parts {
-			if body := getPlainTextBody(part); body != "" {
-				return body
+			if strings.HasPrefix(strings.ToLower(part.MimeType), "text/") ||
+				strings.HasPrefix(strings.ToLower(part.MimeType), "multipart/") {
+				if body := getPlainTextBody(part); body != "" {
+					return body
+				}
 			}
 		}
 	}
@@ -176,22 +186,29 @@ func (c *Client) applyFilters(email *ProcessedEmail) bool {
 
 func (c *Client) StartMonitoring(ctx context.Context, emailChan chan<- ProcessedEmail, initialDelay time.Duration, pollInterval time.Duration) {
 	var lastMessageId string
-	time.Sleep(initialDelay) // Give TUI a moment to draw
+	time.Sleep(initialDelay)
 
-	// --- Initial Fetch ---
-	log.Printf("Gmail Monitor: Performing initial fetch for last %d emails...", initialFetchCount)
-	initialListCall := c.srv.Users.Messages.List(user).MaxResults(initialFetchCount)
+	// Query to get messages in INBOX and NOT in DRAFTS.
+	// This will fetch from all categories (Primary, Social, Promotions, etc.) within the inbox.
+	inboxNotDraftQuery := "in:inbox -in:draft"
+
+	log.Printf("Gmail Monitor: Performing initial fetch for last %d emails (inbox, not drafts)...", initialFetchCount)
+	initialListCall := c.srv.Users.Messages.List(user).
+		MaxResults(initialFetchCount).
+		Q(inboxNotDraftQuery) // ADDED: Query to filter
+
 	initialList, err := initialListCall.Do()
 	if err != nil {
 		log.Printf("Gmail Monitor: Unable to retrieve initial list of messages: %v.", err)
 	} else if len(initialList.Messages) == 0 {
-		log.Println("Gmail Monitor: No messages found in initial fetch.")
+		log.Println("Gmail Monitor: No messages found in initial fetch (inbox, not drafts).")
 	} else {
-		log.Printf("Gmail Monitor: Fetched %d initial messages.", len(initialList.Messages))
-		lastMessageId = initialList.Messages[0].Id // Newest is the baseline for future polls
-		log.Printf("Gmail Monitor: Baseline for future polls set to message ID %s.", lastMessageId)
+		log.Printf("Gmail Monitor: Fetched %d initial messages (inbox, not drafts).", len(initialList.Messages))
+		if len(initialList.Messages) > 0 {
+			lastMessageId = initialList.Messages[0].Id
+			log.Printf("Gmail Monitor: Baseline for future polls set to message ID %s.", lastMessageId)
+		}
 
-		// Send to TUI in oldest-first order from this initial batch
 		for i := len(initialList.Messages) - 1; i >= 0; i-- {
 			msgID := initialList.Messages[i].Id
 			fullMsg, err := c.srv.Users.Messages.Get(user, msgID).Format("full").Do()
@@ -211,9 +228,8 @@ func (c *Client) StartMonitoring(ctx context.Context, emailChan chan<- Processed
 			}
 		}
 	}
-	log.Println("Gmail Monitor: Initial message processing complete. Starting periodic checks...")
+	log.Println("Gmail Monitor: Initial message processing complete. Starting periodic checks (inbox, not drafts)...")
 
-	// --- Periodic Polling ---
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -223,28 +239,40 @@ func (c *Client) StartMonitoring(ctx context.Context, emailChan chan<- Processed
 			log.Println("Gmail Monitor: Stopping.")
 			return
 		case <-ticker.C:
-			newListCall := c.srv.Users.Messages.List(user).MaxResults(periodicFetchCount)
+			log.Printf("Gmail Monitor: Checking for new messages (inbox, not drafts)...")
+			newListCall := c.srv.Users.Messages.List(user).
+				MaxResults(periodicFetchCount).
+				Q(inboxNotDraftQuery) // ADDED: Query to filter
+
 			newList, err := newListCall.Do()
 			if err != nil {
 				log.Printf("Gmail Monitor: Error checking for new messages: %v", err)
 				continue
 			}
 			if len(newList.Messages) == 0 {
+				log.Println("Gmail Monitor: No new messages found this poll (inbox, not drafts).")
 				continue
 			}
 
 			var newMessagesToProcess []*gmail.Message
 			foundLastMessage := false
-			for _, m := range newList.Messages {
-				if m.Id == lastMessageId {
-					foundLastMessage = true
-					break
+			if lastMessageId == "" && len(newList.Messages) > 0 {
+				log.Println("Gmail Monitor: No previous lastMessageId, processing all fetched messages as new.")
+				newMessagesToProcess = newList.Messages
+			} else if lastMessageId != "" {
+				for _, m := range newList.Messages {
+					if m.Id == lastMessageId {
+						foundLastMessage = true
+						break
+					}
+					newMessagesToProcess = append(newMessagesToProcess, m)
 				}
-				newMessagesToProcess = append(newMessagesToProcess, m)
 			}
 
 			if !foundLastMessage && lastMessageId != "" && len(newMessagesToProcess) == periodicFetchCount {
-				log.Printf("Gmail Monitor: All %d fetched messages are new. This matches periodicFetchCount, so there might be more new emails than fetched.", len(newMessagesToProcess))
+				log.Printf("Gmail Monitor: All %d fetched messages are new and different from last ID %s. This matches periodicFetchCount, so there might be more new emails than fetched.", len(newMessagesToProcess), lastMessageId)
+			} else if len(newMessagesToProcess) > 0 {
+				log.Printf("Gmail Monitor: Found %d new messages to process.", len(newMessagesToProcess))
 			}
 
 			for i := len(newMessagesToProcess) - 1; i >= 0; i-- {

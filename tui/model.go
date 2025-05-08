@@ -22,7 +22,7 @@ const (
 )
 
 const (
-	emailListItemHeight = 4
+	emailListItemHeight = 4 // Each item in the list takes 4 lines
 	minListPaneWidth    = 30
 	minPreviewPaneWidth = 40
 )
@@ -32,10 +32,11 @@ type Model struct {
 	emailChan       <-chan gmail.ProcessedEmail
 	apiPollInterval time.Duration
 
-	allEmails        []gmail.ProcessedEmail
-	selectedIdx      int
-	viewportTopLine  int
-	previewScrollPos int
+	allEmails             []gmail.ProcessedEmail
+	selectedIdx           int
+	viewportTopLine       int // For scrolling the email list view
+	previewScrollPos      int // For scrolling the preview pane content
+	focusedEmailScrollPos int // For scrolling the focused email view content
 
 	currentView viewState
 
@@ -50,13 +51,16 @@ type Model struct {
 
 func NewInitialModel(cfgManager *config.Manager, emailChan <-chan gmail.ProcessedEmail, pollInterval time.Duration) Model {
 	return Model{
-		configManager:   cfgManager,
-		emailChan:       emailChan,
-		apiPollInterval: pollInterval,
-		currentView:     viewLoading,
-		statusBarText:   "Initializing, connecting to Gmail...",
-		allEmails:       []gmail.ProcessedEmail{},
-		selectedIdx:     0,
+		configManager:         cfgManager,
+		emailChan:             emailChan,
+		apiPollInterval:       pollInterval,
+		currentView:           viewLoading,
+		statusBarText:         "Initializing, connecting to Gmail...",
+		allEmails:             []gmail.ProcessedEmail{},
+		selectedIdx:           0,
+		viewportTopLine:       0,
+		previewScrollPos:      0,
+		focusedEmailScrollPos: 0,
 	}
 }
 
@@ -86,17 +90,26 @@ func (m Model) getNumItemsThatFitInList() int {
 	numFit := h / emailListItemHeight
 	if numFit < 0 {
 		numFit = 0
-	} // Ensure it's not negative
+	}
 	return numFit
 }
 
-// getVisiblePreviewBodyHeight estimates the number of text lines available for the email body in the preview pane.
-// THIS IS CALLED AFTER RENDERING HEADERS in the refined renderPreviewPane.
 func (m Model) getVisiblePreviewBodyHeight(paneTotalHeight int, renderedHeaderHeight int) int {
-	previewTitleHeight := lipgloss.Height(TitleStyle.Render(" ")) // Height of the title bar itself
-
-	// Available height for body is total pane height minus title, minus rendered headers, minus container paddings
+	previewTitleHeight := lipgloss.Height(TitleStyle.Render(" "))
 	availableHeight := paneTotalHeight - previewTitleHeight - renderedHeaderHeight - ContentBoxStyle.GetVerticalPadding()
+	if availableHeight < 0 {
+		availableHeight = 0
+	}
+	return availableHeight
+}
+
+// getFocusedViewContentRenderHeight estimates available lines for the scrollable content in focused view
+func (m Model) getFocusedViewContentRenderHeight(paneTotalHeight int) int {
+	// Assuming similar title and ContentBoxStyle padding as preview
+	titleHeight := lipgloss.Height(TitleStyle.Render(" "))
+	// Focused view might not have an explicit footer like the old tview Frame,
+	// so we just subtract title and box padding from the total pane height.
+	availableHeight := paneTotalHeight - titleHeight - ContentBoxStyle.GetVerticalPadding()
 	if availableHeight < 0 {
 		availableHeight = 0
 	}
@@ -120,6 +133,85 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseMsg:
+		// --- MOUSE EVENT HANDLING ---
+		listPaneBoundaryX := int(float64(m.width) * 0.35) // Simplified boundary
+		if listPaneBoundaryX < minListPaneWidth {
+			listPaneBoundaryX = minListPaneWidth
+		}
+		if listPaneBoundaryX > m.width-minPreviewPaneWidth && m.width > minPreviewPaneWidth {
+			listPaneBoundaryX = m.width - minPreviewPaneWidth
+		}
+		if listPaneBoundaryX < 0 {
+			listPaneBoundaryX = 0
+		}
+
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			if m.currentView == viewDashboard {
+				if msg.X < listPaneBoundaryX { // Over email list
+					if m.viewportTopLine > 0 {
+						m.viewportTopLine--
+					}
+				} else { // Over preview pane
+					if m.previewScrollPos > 0 {
+						m.previewScrollPos--
+					}
+				}
+			} else if m.currentView == viewFocusedEmail {
+				if m.focusedEmailScrollPos > 0 {
+					m.focusedEmailScrollPos--
+				}
+			}
+			return m, nil
+
+		case tea.MouseWheelDown:
+			if m.currentView == viewDashboard {
+				if msg.X < listPaneBoundaryX { // Over email list
+					itemsThatFit := m.getNumItemsThatFitInList()
+					if len(m.allEmails) > itemsThatFit && m.viewportTopLine < len(m.allEmails)-itemsThatFit {
+						m.viewportTopLine++
+					}
+				} else { // Over preview pane
+					// Simplified boundary for preview scroll down
+					if len(m.allEmails) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.allEmails) {
+						emailContent := m.allEmails[m.selectedIdx].Body // Just an example, need full content lines
+						bodyLines := strings.Split(strings.ReplaceAll(emailContent, "\r\n", "\n"), "\n")
+						if m.previewScrollPos < len(bodyLines)-1 {
+							m.previewScrollPos++
+						}
+					}
+				}
+			} else if m.currentView == viewFocusedEmail {
+				// Simplified boundary for focused scroll down
+				// A more robust check considers the number of lines the content actually renders to.
+				m.focusedEmailScrollPos++
+			}
+			return m, nil
+
+		case tea.MouseLeft: // CLICK TO SELECT
+			if m.currentView == viewDashboard && msg.X < listPaneBoundaryX { // Click is in the list pane
+				// Calculate which item was clicked. msg.Y is the row, 0-indexed from top of screen.
+				// We need Y relative to the start of the list items area.
+				listTitleRenderedHeight := lipgloss.Height(EmailListTitleStyle.Render(" "))
+				listStartY := listTitleRenderedHeight // Y where email items start (after status bar and title)
+
+				clickedItemIndex := (msg.Y - listStartY) / emailListItemHeight
+				actualClickedIdx := m.viewportTopLine + clickedItemIndex
+
+				if actualClickedIdx >= 0 && actualClickedIdx < len(m.allEmails) {
+					if m.selectedIdx != actualClickedIdx { // Only update if selection changes
+						m.selectedIdx = actualClickedIdx
+						m.previewScrollPos = 0      // Reset preview scroll
+						m.focusedEmailScrollPos = 0 // Reset focused scroll (good practice)
+						m.ensureSelectedVisible()   // Should not be strictly needed if already visible, but good for consistency
+						m.setStandardStatus()       // Update status if needed
+					}
+				}
+			}
+			return m, nil
+		}
+
 	case tea.KeyMsg:
 		switch m.currentView {
 		case viewDashboard:
@@ -132,40 +224,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedIdx--
 					m.ensureSelectedVisible()
 					m.previewScrollPos = 0
+					m.focusedEmailScrollPos = 0 // Reset focused view scroll too
 				}
 			case "down", "j":
 				if m.selectedIdx < len(m.allEmails)-1 {
 					m.selectedIdx++
 					m.ensureSelectedVisible()
 					m.previewScrollPos = 0
+					m.focusedEmailScrollPos = 0 // Reset focused view scroll too
 				}
 			case "enter":
 				if len(m.allEmails) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.allEmails) {
 					m.currentView = viewFocusedEmail
+					m.focusedEmailScrollPos = 0 // Reset scroll when entering focused view
 					m.setStandardStatus()
 				}
-			case "K": // Preview scroll up (Shift+K)
+			case "K":
 				if m.previewScrollPos > 0 {
 					m.previewScrollPos--
 				}
-			case "J": // Preview scroll down (Shift+J)
-				// This scrolling logic for 'J' can be complex without a proper viewport.
-				// The key is to know how many lines of body text are *actually* visible.
-				// The current getVisiblePreviewBodyHeight is an estimate made after header rendering.
+			case "J":
 				if len(m.allEmails) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.allEmails) {
 					email := m.allEmails[m.selectedIdx]
 					bodyLines := strings.Split(strings.ReplaceAll(email.Body, "\r\n", "\n"), "\n")
-
-					// We need a way to get the *actual* rendered header height for a more accurate calculation here.
-					// For simplicity now, we'll keep it as is, but this is where a viewport shines.
-					// A more robust check would be:
-					// if m.previewScrollPos < len(bodyLines) - (lines_that_actually_fit_on_screen_for_body)
-					if m.previewScrollPos < len(bodyLines)-1 { // Simplified: just don't scroll past last line
+					if m.previewScrollPos < len(bodyLines)-1 {
 						m.previewScrollPos++
 					}
 				}
 			}
 		case viewFocusedEmail:
+			// ADDED: Key-based scrolling for focused view
 			switch msg.String() {
 			case "ctrl+c", "q":
 				m.updateStatusBar("Quitting...")
@@ -173,6 +261,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.currentView = viewDashboard
 				m.setStandardStatus()
+			case "up", "k": // Scroll focused view up
+				if m.focusedEmailScrollPos > 0 {
+					m.focusedEmailScrollPos--
+				}
+			case "down", "j": // Scroll focused view down
+				// Simplified boundary, similar to mouse wheel
+				m.focusedEmailScrollPos++
 			}
 		case viewLoading:
 			switch msg.String() {
@@ -261,6 +356,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// ... (showTemporaryStatus, updateStatusBar, updateStatusError, setStandardStatus, ensureSelectedVisible, View, renderEmailList, renderPreviewPane methods remain THE SAME) ...
 func (m *Model) showTemporaryStatus(text string, duration time.Duration, cmds *[]tea.Cmd) {
 	m.statusBarText = text
 	m.statusIsError = false
@@ -298,9 +394,9 @@ func (m *Model) setStandardStatus() {
 	keyHints := "[Q/Ctrl+C]:Quit"
 	switch m.currentView {
 	case viewDashboard:
-		keyHints += " | [↑↓/jk]:Nav | [Enter]:Full | [KJ]:Scroll Preview"
+		keyHints += " | [↑↓/jk]:Nav | [Enter]:Full | [KJ]:Scroll Preview | [MouseWheel/Click]:Interact"
 	case viewFocusedEmail:
-		keyHints += " | [Esc]:Back"
+		keyHints += " | [Esc]:Back | [↑↓/jk/MouseWheel]:Scroll"
 	case viewLoading:
 		keyHints = "[Q/Ctrl+C]:Quit"
 	}
@@ -347,7 +443,6 @@ func (m Model) View() string {
 
 	var mainUIView string
 	statusBarHeight := 1
-	// contentHeight is the total height available for the main view area (list + preview, or focused)
 	contentHeight := m.height - statusBarHeight
 	if contentHeight < 0 {
 		contentHeight = 0
@@ -366,7 +461,7 @@ func (m Model) View() string {
 		if actualListPaneWidth < minListPaneWidth {
 			actualListPaneWidth = minListPaneWidth
 		}
-		if actualListPaneWidth > m.width-minPreviewPaneWidth && m.width > minPreviewPaneWidth { // ensure preview has its min if possible
+		if actualListPaneWidth > m.width-minPreviewPaneWidth && m.width > minPreviewPaneWidth {
 			actualListPaneWidth = m.width - minPreviewPaneWidth
 		}
 		if actualListPaneWidth < 0 {
@@ -381,26 +476,22 @@ func (m Model) View() string {
 			actualPreviewPaneWidth = 0
 		}
 
-		if m.width < minListPaneWidth+minPreviewPaneWidth { // Handle very narrow screens
-			if m.width < minListPaneWidth { // Only space for list (or less)
+		if m.width < minListPaneWidth+minPreviewPaneWidth {
+			if m.width < minListPaneWidth {
 				actualListPaneWidth = m.width
 				actualPreviewPaneWidth = 0
-			} else { // Space for min list, rest for preview
+			} else {
 				actualListPaneWidth = minListPaneWidth
 				actualPreviewPaneWidth = m.width - actualListPaneWidth
 			}
 		}
 
-		// Crucially, renderEmailList and renderPreviewPane now take contentHeight,
-		// which is the total height they are allowed to occupy.
-		// Their internal styles should then respect this with .Height(contentHeight)
 		emailListRendered := m.renderEmailList(actualListPaneWidth, contentHeight)
 		previewPaneRendered := m.renderPreviewPane(actualPreviewPaneWidth, contentHeight)
 
 		mainUIView = lipgloss.JoinHorizontal(lipgloss.Top, emailListRendered, previewPaneRendered)
 
 	case viewFocusedEmail:
-		// Similar to above, focused view should also respect contentHeight
 		mainUIView = m.renderFocusedEmailView(m.width, contentHeight)
 	}
 
@@ -445,50 +536,47 @@ func (m Model) renderEmailList(paneWidth, paneHeight int) string {
 	}
 
 	visibleEmailItemStrings := []string{}
-	if paneWidth > 0 && paneHeight > 0 {
+	if paneWidth > 0 && paneHeight > 0 && len(m.allEmails) > 0 {
 		for i := startIdx; i < endIdx; i++ {
-			email := m.allEmails[i]
-			isSelected := (i == m.selectedIdx)
-			itemStr := formatEmailListItem(email, isSelected, itemTextContentWidth)
-			visibleEmailItemStrings = append(visibleEmailItemStrings, itemStr)
+			if i >= 0 && i < len(m.allEmails) {
+				email := m.allEmails[i]
+				isSelected := (i == m.selectedIdx)
+				itemStr := formatEmailListItem(email, isSelected, itemTextContentWidth)
+				visibleEmailItemStrings = append(visibleEmailItemStrings, itemStr)
+			}
 		}
 	}
 	listItemsContent.WriteString(strings.Join(visibleEmailItemStrings, "\n"))
 
 	fullListRender := lipgloss.JoinVertical(lipgloss.Left, title, listItemsContent.String())
-	// Ensure the EmailListStyle itself is constrained by paneWidth and paneHeight
 	return EmailListStyle.Width(paneWidth).Height(paneHeight).Render(fullListRender)
 }
 
 func (m Model) renderPreviewPane(paneWidth, paneHeight int) string {
-	var finalContentToRender string // This will be the content INSIDE the box (headers + body)
+	var finalContentToRender string
 	var titleText string
 
 	if paneWidth <= 0 || paneHeight <= 0 {
-		return "" // No space to render anything
+		return ""
 	}
 
-	// Prepare the title first, as its height is fixed
-	styledTitle := TitleStyle.Render("Placeholder") // Placeholder to get title style height
+	styledTitle := TitleStyle.Render("Placeholder")
 
 	if len(m.allEmails) == 0 || m.selectedIdx < 0 || m.selectedIdx >= len(m.allEmails) {
 		titleText = "Home"
 		welcomeMsg := "\n[tmail]\n\nNo email selected or list is empty."
-		// The welcome message also needs to be constrained.
-		// MaxHeight for the content area: paneHeight - title height - box padding
 		maxContentHeight := paneHeight - lipgloss.Height(styledTitle) - ContentBoxStyle.GetVerticalPadding()
 		if maxContentHeight < 0 {
 			maxContentHeight = 0
 		}
 		finalContentToRender = lipgloss.NewStyle().
-			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()). // Width for text inside box
-			MaxHeight(maxContentHeight).                               // Constrain height
+			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()).
+			MaxHeight(maxContentHeight).
 			Padding(1).Render(welcomeMsg)
 	} else {
 		email := m.allEmails[m.selectedIdx]
 		titleText = fmt.Sprintf("Preview: %s", truncate(email.Subject, paneWidth-(TitleStyle.GetHorizontalPadding()+12)))
 
-		// Render headers to know their exact height
 		var headerBuilder strings.Builder
 		headerBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("From:"), HeaderValStyle.Render(truncate(email.From, paneWidth-10))))
 		dateStr := "N/A"
@@ -497,12 +585,11 @@ func (m Model) renderPreviewPane(paneWidth, paneHeight int) string {
 		}
 		headerBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("Date:"), HeaderValStyle.Render(dateStr)))
 		headerBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("Subject:"), HeaderValStyle.Render(truncate(email.Subject, paneWidth-12))))
-		headerBuilder.WriteString("\n" + strings.Repeat("─", paneWidth/2)) // Separator, its height is 1
+		headerBuilder.WriteString("\n" + strings.Repeat("─", paneWidth/2))
 
 		renderedHeaders := headerBuilder.String()
-		renderedHeaderHeight := lipgloss.Height(renderedHeaders) // Get actual height of rendered headers + separator
+		renderedHeaderHeight := lipgloss.Height(renderedHeaders)
 
-		// Now calculate available height for the body
 		bodyDisplayHeight := m.getVisiblePreviewBodyHeight(paneHeight, renderedHeaderHeight)
 
 		bodyLines := strings.Split(strings.ReplaceAll(email.Body, "\r\n", "\n"), "\n")
@@ -510,10 +597,9 @@ func (m Model) renderPreviewPane(paneWidth, paneHeight int) string {
 		if startLine < 0 {
 			startLine = 0
 		}
-		// Adjust startLine if it's scrolled too far down for the available bodyDisplayHeight
 		if len(bodyLines) > bodyDisplayHeight && startLine > len(bodyLines)-bodyDisplayHeight && bodyDisplayHeight > 0 {
 			startLine = len(bodyLines) - bodyDisplayHeight
-		} else if startLine >= len(bodyLines) && len(bodyLines) > 0 { // Scrolled past everything
+		} else if startLine >= len(bodyLines) && len(bodyLines) > 0 {
 			startLine = len(bodyLines) - 1
 		}
 		if len(bodyLines) == 0 {
@@ -530,31 +616,24 @@ func (m Model) renderPreviewPane(paneWidth, paneHeight int) string {
 			visibleBody = strings.Join(bodyLines[startLine:endLine], "\n")
 		}
 
-		// Combine rendered headers and the calculated visible body
-		// The BodyStyle might add margins, consider that if heights are still off.
 		finalContentToRender = lipgloss.JoinVertical(lipgloss.Left,
-			renderedHeaders, // Already has a newline from separator
+			renderedHeaders,
 			BodyStyle.Render(visibleBody),
 		)
-		// Style for the content block *inside* the ContentBoxStyle borders
 		finalContentToRender = lipgloss.NewStyle().
-			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()).                                   // Content width inside the box
-			MaxHeight(paneHeight - lipgloss.Height(styledTitle) - ContentBoxStyle.GetVerticalPadding()). // Max height for content
+			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()).
+			MaxHeight(paneHeight - lipgloss.Height(styledTitle) - ContentBoxStyle.GetVerticalPadding()).
 			Render(finalContentToRender)
 	}
 
-	// Update the actual title text on the pre-styled title
 	styledTitle = TitleStyle.Render(titleText)
-
-	// The ContentBoxStyle provides the outer border and is constrained by paneWidth, paneHeight.
-	// It joins the styledTitle and finalContentToRender.
 	return ContentBoxStyle.Width(paneWidth).Height(paneHeight).Render(
 		lipgloss.JoinVertical(lipgloss.Top, styledTitle, finalContentToRender),
 	)
 }
 
 func (m Model) renderFocusedEmailView(paneWidth, paneHeight int) string {
-	var finalContentToRender string
+	var finalContent string // This will be the scrollable content part
 	var titleText string
 
 	if paneWidth <= 0 || paneHeight <= 0 {
@@ -569,7 +648,7 @@ func (m Model) renderFocusedEmailView(paneWidth, paneHeight int) string {
 		if maxContentHeight < 0 {
 			maxContentHeight = 0
 		}
-		finalContentToRender = lipgloss.NewStyle().
+		finalContent = lipgloss.NewStyle().
 			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()).
 			MaxHeight(maxContentHeight).
 			Padding(1).Render("No email selected.")
@@ -577,6 +656,7 @@ func (m Model) renderFocusedEmailView(paneWidth, paneHeight int) string {
 		email := m.allEmails[m.selectedIdx]
 		titleText = fmt.Sprintf("Full View: %s", truncate(email.Subject, paneWidth-(TitleStyle.GetHorizontalPadding()+15)))
 
+		// Build the full content string that will be scrolled
 		var contentBuilder strings.Builder
 		contentBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("From:"), HeaderValStyle.Render(email.From)))
 		contentBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("To:"), HeaderValStyle.Render(email.To)))
@@ -590,24 +670,50 @@ func (m Model) renderFocusedEmailView(paneWidth, paneHeight int) string {
 		contentBuilder.WriteString(fmt.Sprintf("%s %s\n", HeaderKeyStyle.Render("Date:"), HeaderValStyle.Render(dateStr)))
 		contentBuilder.WriteString(fmt.Sprintf("%s %s\n\n", HeaderKeyStyle.Render("Subject:"), HeaderValStyle.Render(email.Subject)))
 		contentBuilder.WriteString(strings.Repeat("─", paneWidth/2) + "\n\n")
+		fullBodyText := strings.ReplaceAll(email.Body, "\r\n", "\n")
+		contentBuilder.WriteString(BodyStyle.Render(fullBodyText)) // Render with BodyStyle for consistent look
 
-		fullBody := strings.ReplaceAll(email.Body, "\r\n", "\n")
-		contentBuilder.WriteString(BodyStyle.Render(fullBody)) // BodyStyle might add margins
+		fullContentString := contentBuilder.String()
+		fullContentLines := strings.Split(fullContentString, "\n")
 
-		maxContentHeight := paneHeight - lipgloss.Height(styledTitle) - ContentBoxStyle.GetVerticalPadding()
-		if maxContentHeight < 0 {
-			maxContentHeight = 0
+		// Calculate how many lines of this content can be displayed
+		displayHeight := m.getFocusedViewContentRenderHeight(paneHeight)
+
+		startLine := m.focusedEmailScrollPos
+		if startLine < 0 {
+			startLine = 0
 		}
-		finalContentToRender = lipgloss.NewStyle().
-			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()).
-			MaxHeight(maxContentHeight). // Important for very long emails
-			// Padding(0,1) was here, but ContentBoxStyle already has padding(0,1)
-			Render(contentBuilder.String())
+		// Adjust startLine if it's scrolled too far down
+		if len(fullContentLines) > displayHeight && startLine > len(fullContentLines)-displayHeight && displayHeight > 0 {
+			startLine = len(fullContentLines) - displayHeight
+		} else if startLine >= len(fullContentLines) && len(fullContentLines) > 0 {
+			startLine = len(fullContentLines) - 1
+		}
+		if len(fullContentLines) == 0 {
+			startLine = 0
+		}
+
+		endLine := startLine + displayHeight
+		if endLine > len(fullContentLines) {
+			endLine = len(fullContentLines)
+		}
+
+		visibleContent := ""
+		if startLine < endLine && startLine < len(fullContentLines) {
+			visibleContent = strings.Join(fullContentLines[startLine:endLine], "\n")
+		}
+
+		// The final content to be rendered inside the box (after the title)
+		finalContent = lipgloss.NewStyle().
+			Width(paneWidth - ContentBoxStyle.GetHorizontalPadding()). // Constrain width
+			// MaxHeight is implicitly handled by slicing the lines
+			Render(visibleContent)
 	}
 
-	styledTitle = TitleStyle.Render(titleText)
+	styledTitle = TitleStyle.Render(titleText) // Update actual title text
+	// The ContentBoxStyle frames the title and the finalContent (scrolled portion)
 	return ContentBoxStyle.Width(paneWidth).Height(paneHeight).Render(
-		lipgloss.JoinVertical(lipgloss.Top, styledTitle, finalContentToRender),
+		lipgloss.JoinVertical(lipgloss.Top, styledTitle, finalContent),
 	)
 }
 
