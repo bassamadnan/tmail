@@ -22,7 +22,7 @@ const (
 	tokenFile          = "token.json"
 	credentialsFile    = "credentials.json"
 	user               = "me"
-	initialFetchCount  = 5  // Number of emails to fetch on startup
+	initialFetchCount  = 20 // Number of emails to fetch on startup
 	periodicFetchCount = 10 // Number of emails to check in periodic polls
 )
 
