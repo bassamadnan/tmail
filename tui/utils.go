@@ -11,10 +11,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// For robust newline removal (handles \r\n, \n, \r)
 var newlineRegex = regexp.MustCompile(`\r\n|\r|\n`)
 
-// truncate shortens a string to a max length, adding "..." if truncated.
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -29,38 +27,29 @@ func truncate(s string, maxLen int) string {
 }
 
 // formatEmailDate formats the date for display in the email list.
+// NOW: Always returns "Jan 2, 3:04 PM" format.
 func formatEmailDate(t time.Time) string {
 	if t.IsZero() {
 		return "???"
 	}
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	emailDay := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-
-	if emailDay.Equal(today) {
-		return t.Local().Format("15:04")
-	}
-	return t.Local().Format("Jan 2")
+	// Go's reference time: Mon Jan 2 15:04:05 -0700 MST 2006
+	// "Jan 2" -> Month Day
+	// "3:04 PM" -> Hour (12-hour), Minute, AM/PM marker
+	return t.Local().Format("Jan 2, 3:04 PM") // e.g., "May 7, 1:15 PM", "Dec 25, 9:00 AM"
 }
 
 // sanitizeStringForLineAggressive removes newlines and other non-printable characters.
 func sanitizeStringForLineAggressive(s string) string {
-	// First, handle explicit newline sequences by replacing them with a space
 	s = newlineRegex.ReplaceAllString(s, " ")
-
-	// Then, iterate through runes to keep only printable characters
-	// and replace others with a space.
 	var builder strings.Builder
 	for _, r := range s {
-		if unicode.IsPrint(r) { // unicode.IsPrint checks if the rune is printable
+		if unicode.IsPrint(r) {
 			builder.WriteRune(r)
 		} else {
-			builder.WriteRune(' ') // Replace non-printable with a space
+			builder.WriteRune(' ')
 		}
 	}
 	s = builder.String()
-
-	// Finally, collapse multiple spaces that might have resulted from replacements
 	return strings.Join(strings.Fields(s), " ")
 }
 
@@ -82,14 +71,15 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 		itemBlockStyle = EmailListItemStyle
 	}
 
-	// Use aggressive sanitization
+	// --- Subject Line Formatting (Line 2) ---
 	subject := sanitizeStringForLineAggressive(email.Subject)
 	if subject == "" {
 		subject = "(No Subject)"
 	}
 	truncatedSubject := truncate(subject, itemContentTextWidth)
-	paddedSubjectText := fmt.Sprintf("%-*s", itemContentTextWidth, truncatedSubject)
+	paddedSubjectText := fmt.Sprintf("%-*s", itemContentTextWidth, truncatedSubject) // Left align subject
 
+	// --- From / Date Line Formatting (Line 3) ---
 	fromShort := sanitizeStringForLineAggressive(email.From)
 	if idx := strings.Index(fromShort, "<"); idx > 0 {
 		fromShort = strings.TrimSpace(fromShort[:idx])
@@ -97,29 +87,32 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 	if fromShort == "" {
 		fromShort = "(Unknown Sender)"
 	}
-	dateStr := formatEmailDate(email.Date)
+	// Get the *full* date/time string first
+	dateTimeStr := formatEmailDate(email.Date) // e.g., "May 7, 1:15 PM"
 
-	maxFromLen := itemContentTextWidth - (len(dateStr) + 1)
+	// Calculate max length for the 'from' part to fit with the date/time and at least one space
+	maxFromLen := itemContentTextWidth - len(dateTimeStr) - 1 // -1 for the separating space
 	if maxFromLen < 1 {
-		fromShort = ""
-		if len(dateStr) > itemContentTextWidth {
-			dateStr = truncate(dateStr, itemContentTextWidth)
+		// If date/time alone is too long, truncate it (should be rare)
+		if len(dateTimeStr) > itemContentTextWidth {
+			dateTimeStr = truncate(dateTimeStr, itemContentTextWidth)
 		}
+		fromShort = "" // No space for sender name
 	} else {
 		fromShort = truncate(fromShort, maxFromLen)
 	}
 
-	var fromToDateCombined string
-	if fromShort != "" {
-		fromToDateCombined = fmt.Sprintf("%s %s", fromShort, dateStr)
-	} else {
-		fromToDateCombined = dateStr
+	// Calculate padding needed to right-align the date/time
+	paddingSize := itemContentTextWidth - len(fromShort) - len(dateTimeStr)
+	if paddingSize < 0 {
+		paddingSize = 0 // Should not happen if truncation above is correct
 	}
-	if len(fromToDateCombined) > itemContentTextWidth {
-		fromToDateCombined = truncate(fromToDateCombined, itemContentTextWidth)
-	}
-	paddedFromToDateText := fmt.Sprintf("%-*s", itemContentTextWidth, fromToDateCombined)
+	padding := strings.Repeat(" ", paddingSize)
 
+	// Construct the From/Date line with right-aligned date/time
+	fromToDateLineText := fmt.Sprintf("%s%s%s", fromShort, padding, dateTimeStr)
+
+	// --- Assemble the 4 lines ---
 	horizontalBar := strings.Repeat(BoxHorizontal, itemContentTextWidth+2)
 
 	line1 := fmt.Sprintf("%s%s%s",
@@ -129,12 +122,12 @@ func formatEmailListItem(email gmail.ProcessedEmail, isSelected bool, itemConten
 	)
 	line2 := fmt.Sprintf("%s %s %s",
 		boxCharStyle.Render(BoxVertical),
-		subjectStyle.Render(paddedSubjectText),
+		subjectStyle.Render(paddedSubjectText), // Render subject line
 		boxCharStyle.Render(BoxVertical),
 	)
 	line3 := fmt.Sprintf("%s %s %s",
 		boxCharStyle.Render(BoxVertical),
-		secondaryTextStyle.Render(paddedFromToDateText),
+		secondaryTextStyle.Render(fromToDateLineText), // Render from/date line
 		boxCharStyle.Render(BoxVertical),
 	)
 	line4 := fmt.Sprintf("%s%s%s",
